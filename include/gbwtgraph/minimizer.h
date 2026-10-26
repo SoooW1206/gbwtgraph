@@ -14,6 +14,7 @@
 #include <gbwt/utils.h>
 
 #include <gbwtgraph/io.h>
+#include <gbwtgraph/minimax.h>
 #include <gbwtgraph/utils.h>
 
 /*
@@ -570,6 +571,7 @@ public:
     this->hash_table.swap(another.hash_table);
     std::swap(this->downweight, another.downweight);
     this->frequent_kmers.swap(another.frequent_kmers);
+    std::swap(this->minimax, another.minimax);
   }
 
   KmerIndex& operator=(const KmerIndex& source)
@@ -590,6 +592,7 @@ public:
       this->hash_table = std::move(source.hash_table);
       this->downweight = std::move(source.downweight);
       this->frequent_kmers = std::move(source.frequent_kmers);
+      this->minimax = source.minimax;
     }
     return *this;
   }
@@ -638,6 +641,24 @@ public:
 
   // Is the index empty?
   bool empty() const { return (this->size() == 0); }
+
+  // Are minimizers selected by minimaxmer order values? Cells are still chosen by key.hash().
+  bool uses_minimaxmers() const { return (this->minimax != nullptr); }
+
+  // Minimaxmer order values of a k-mer in both orientations. Returns false if the k-mer is not
+  // a candidate (not in the counts). Requires uses_minimaxmers().
+  bool minimaxmer_hashes(key_type forward_key, key_type reverse_key, size_t& forward_hash, size_t& reverse_hash) const
+  {
+    if constexpr(std::is_same<KeyType, Key64>::value)
+    {
+      std::uint32_t packed = 0;
+      if(!this->minimax->find(std::min(forward_key.get_key(), reverse_key.get_key()), packed)) { return false; }
+      forward_hash = MinimaxCounts::order(packed, forward_key.hash());
+      reverse_hash = MinimaxCounts::order(packed, reverse_key.hash());
+      return true;
+    }
+    else { return false; }
+  }
 
   // Number of values (kmer occurrences) in the index.
   size_t number_of_values() const { return this->values; }
@@ -850,6 +871,9 @@ private:
   size_t downweight;
   std::vector<key_type> frequent_kmers;
 
+  // Minimaxmer counts, if minimizers are selected by minimaxmer order values. Not owned and not serialized.
+  const MinimaxCounts* minimax = nullptr;
+
   // Needed for serialization.
   friend class MinimizerHeader;
   friend class MinimizerIndex<KeyType>;
@@ -917,6 +941,7 @@ private:
 
     this->downweight = source.downweight;
     this->frequent_kmers = source.frequent_kmers;
+    this->minimax = source.minimax;
   }
 
   // Clears the value stored in the given cell.
@@ -1646,7 +1671,16 @@ public:
     void advance(offset_type pos, key_type forward_key, key_type reverse_key)
     {
       if(!(this->empty()) && this->front().offset + this->w <= pos) { this->head++; }
-      size_t forward_hash = this->parent.hash(forward_key), reverse_hash = this->parent.hash(reverse_key);
+      size_t forward_hash = 0, reverse_hash = 0;
+      if(this->parent.uses_minimaxmers())
+      {
+        // Minimaxmers: a k-mer that is not in the counts is not a candidate.
+        if(!this->parent.minimaxmer_hashes(forward_key, reverse_key, forward_hash, reverse_hash)) { return; }
+      }
+      else
+      {
+        forward_hash = this->parent.hash(forward_key); reverse_hash = this->parent.hash(reverse_key);
+      }
       size_t hash = std::min(forward_hash, reverse_hash);
       while(!(this->empty()) && this->back().hash > hash) { this->tail--; }
       this->tail++;
@@ -1720,9 +1754,11 @@ public:
 
     // It was more convenient to use the first offset of the kmer, regardless of the orientation.
     // If the minimizer is a reverse complement, we must return the last offset instead.
+    // Minimaxmers were selected by order values; the hash table uses the key's own hash.
     for(minimizer_type& minimizer : result)
     {
       if(minimizer.is_reverse) { minimizer.offset += this->k() - 1; }
+      if(this->uses_minimaxmers()) { minimizer.hash = minimizer.key.hash(); }
     }
     std::sort(result.begin(), result.end());
 
@@ -1853,9 +1889,11 @@ public:
 
     // It was more convenient to use the first offset of the kmer, regardless of the orientation.
     // If the minimizer is a reverse complement, we must return the last offset instead.
+    // Minimaxmers were selected by order values; the hash table uses the key's own hash.
     for(auto& record : result)
     {
       if(std::get<0>(record).is_reverse) { std::get<0>(record).offset += this->k() - 1; }
+      if(this->uses_minimaxmers()) { std::get<0>(record).hash = std::get<0>(record).key.hash(); }
     }
     std::sort(result.begin(), result.end());
 
@@ -1979,6 +2017,10 @@ public:
     {
       throw std::runtime_error("MinimizerIndex::add_frequent_kmers(): Cannot use frequent kmers with syncmers");
     }
+    if(this->uses_minimaxmers())
+    {
+      throw std::runtime_error("MinimizerIndex::add_frequent_kmers(): Cannot use frequent kmers with minimaxmers");
+    }
     size_t max_iterations = MinimizerHeader::FLAG_WEIGHT_MASK >> MinimizerHeader::FLAG_WEIGHT_OFFSET;
     if(iterations > max_iterations)
     {
@@ -2004,6 +2046,41 @@ public:
     this->index.downweight = iterations;
     this->header.set_int(MinimizerHeader::FLAG_WEIGHT_MASK, MinimizerHeader::FLAG_WEIGHT_OFFSET, iterations);
   }
+
+  /*
+    Selects minimizers by minimaxmer order values from the given counts instead of hashes
+    (minimaxmers: Yoshi Suzuki's himapper_rp). Only the selection changes: the selected
+    minimizers carry the key's own hash, which chooses the hash table cell as in a plain index.
+    The counts are not owned or serialized: the same counts must be set when building the index
+    and every time it is used. nullptr clears them.
+
+    Throws std::runtime_error if the key type is not Key64, the index uses syncmers or frequent
+    kmers, or k differs from the counts.
+  */
+  void set_minimaxmer_counts(const MinimaxCounts* counts)
+  {
+    if(counts == nullptr) { this->index.minimax = nullptr; return; }
+    if(!std::is_same<KeyType, Key64>::value)
+    {
+      throw std::runtime_error("MinimizerIndex::set_minimaxmer_counts(): Minimaxmers require 64-bit keys");
+    }
+    if(this->uses_syncmers())
+    {
+      throw std::runtime_error("MinimizerIndex::set_minimaxmer_counts(): Cannot use minimaxmers with syncmers");
+    }
+    if(!this->index.frequent_kmers.empty())
+    {
+      throw std::runtime_error("MinimizerIndex::set_minimaxmer_counts(): Cannot use minimaxmers with frequent kmers");
+    }
+    if(counts->k() != this->k())
+    {
+      throw std::runtime_error("MinimizerIndex::set_minimaxmer_counts(): Counts have k = " + std::to_string(counts->k()) + ", index has k = " + std::to_string(this->k()));
+    }
+    this->index.minimax = counts;
+  }
+
+  // Are minimizers selected by minimaxmer order values?
+  bool uses_minimaxmers() const { return this->index.uses_minimaxmers(); }
 
   /*
     Inserts the value into the index, using minimizer.key as the key and
